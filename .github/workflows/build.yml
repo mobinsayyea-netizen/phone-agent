@@ -1,0 +1,67 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Decode keystore
+        run: |
+          KEYSTORE_B64="${{ secrets.KEYSTORE_B64 }}"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build phone APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          gradle assembleRelease 2>&1 | tee build_output.log
+
+      - name: Upload build log (only if the build failed)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f build_output.log ]; then
+            gh release create "buildlog-${{ github.run_number }}" build_output.log \
+              --title "Build log for failed run ${{ github.run_number }}" \
+              --notes "Full gradle output from the failed build. Safe to delete once read." \
+              --prerelease
+          else
+            echo "No build_output.log to upload (an earlier step failed before the build ran)."
+          fi
+
+      - name: Name the APK
+        run: cp app/build/outputs/apk/release/app-release.apk PhoneAgent.apk
+
+      - name: Publish release (direct APK download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" PhoneAgent.apk \
+            --title "Phone Agent build ${{ github.run_number }}" \
+            --notes "Automated build."

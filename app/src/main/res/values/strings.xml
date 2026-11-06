@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">फ़ोन एजेंट</string>
+    <string name="service_desc">फ़ोन एजेंट आपके आदेश पर स्क्रीन पढ़कर ऐप और सेटिंग्स में खुद टैप, टाइप और स्क्रॉल करता है।</string>
+</resources>
