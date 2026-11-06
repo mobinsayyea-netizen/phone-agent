@@ -1,6 +1,18 @@
 package com.mobeen.phoneagent;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.net.Uri;
+import android.os.Handler;
+import androidx.core.content.FileProvider;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -117,6 +129,7 @@ public class MainActivity extends Activity {
     root.addView(close, closeLp);
 
     setContentView(scroll);
+    new Handler(getMainLooper()).postDelayed(this::checkForUpdate, 4000);
   }
 
   @Override
@@ -248,5 +261,124 @@ public class MainActivity extends Activity {
 
   private int dp(int v) {
     return (int) (v * getResources().getDisplayMetrics().density);
+  }
+
+  // ---------------------------------------------------------------- in-app update
+
+  private static final String UPDATE_API =
+      "https://api.github.com/repos/mobinsayyea-netizen/phone-agent/releases/latest";
+  private boolean updateAsked = false;
+
+  /** Looks for a newer build on GitHub; if there is one, asks the person to update. */
+  private void checkForUpdate() {
+    if (updateAsked) return;
+    new Thread(
+            () -> {
+              try {
+                HttpURLConnection c = (HttpURLConnection) new URL(UPDATE_API).openConnection();
+                c.setConnectTimeout(10000);
+                c.setReadTimeout(10000);
+                c.setRequestProperty("Accept", "application/vnd.github+json");
+                if (c.getResponseCode() != 200) return;
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                try (InputStream in = c.getInputStream()) {
+                  byte[] b = new byte[4096];
+                  int n;
+                  while ((n = in.read(b)) > 0) bo.write(b, 0, n);
+                }
+                JSONObject rel = new JSONObject(bo.toString("UTF-8"));
+                String tag = rel.optString("tag_name", "");
+                if (!tag.startsWith("build-")) return;
+                final int latest = Integer.parseInt(tag.substring(6));
+                @SuppressWarnings("deprecation")
+                int current = getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+                if (latest <= current) return;
+                String apkUrl = null;
+                JSONArray assets = rel.optJSONArray("assets");
+                if (assets != null) {
+                  for (int i = 0; i < assets.length(); i++) {
+                    JSONObject a = assets.getJSONObject(i);
+                    if (a.optString("name").endsWith(".apk")) {
+                      apkUrl = a.optString("browser_download_url");
+                      break;
+                    }
+                  }
+                }
+                if (apkUrl == null || apkUrl.isEmpty()) return;
+                final String url = apkUrl;
+                runOnUiThread(() -> showUpdateDialog(latest, url));
+              } catch (Exception ignored) {
+              }
+            })
+        .start();
+  }
+
+  private void showUpdateDialog(int build, final String url) {
+    if (isFinishing() || updateAsked) return;
+    updateAsked = true;
+    new AlertDialog.Builder(this)
+        .setTitle("नया अपडेट उपलब्ध है")
+        .setMessage("फ़ोन एजेंट का नया संस्करण (" + build + ") आ गया है। अभी अपडेट करें?")
+        .setPositiveButton("अपडेट करें", (d, w) -> downloadAndInstall(url))
+        .setNegativeButton("बाद में", null)
+        .show();
+  }
+
+  private void downloadAndInstall(final String url) {
+    if (android.os.Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+      Toast.makeText(
+              this,
+              "इस ऐप को इंस्टॉल की अनुमति दें, फिर वापस आकर अपडेट दोबारा करें",
+              Toast.LENGTH_LONG)
+          .show();
+      startActivity(
+          new Intent(
+              Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+      updateAsked = false;
+      return;
+    }
+    Toast.makeText(this, "अपडेट डाउनलोड हो रहा है, कृपया रुकें", Toast.LENGTH_LONG).show();
+    new Thread(
+            () -> {
+              try {
+                File dir = new File(getCacheDir(), "updates");
+                dir.mkdirs();
+                final File apk = new File(dir, "update.apk");
+                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(15000);
+                c.setReadTimeout(30000);
+                c.setInstanceFollowRedirects(true);
+                try (InputStream in = c.getInputStream();
+                    FileOutputStream out = new FileOutputStream(apk)) {
+                  byte[] b = new byte[16384];
+                  int n;
+                  while ((n = in.read(b)) > 0) out.write(b, 0, n);
+                }
+                runOnUiThread(
+                    () -> {
+                      try {
+                        Uri uri =
+                            FileProvider.getUriForFile(
+                                this, getPackageName() + ".fileprovider", apk);
+                        Intent i = new Intent(Intent.ACTION_VIEW);
+                        i.setDataAndType(uri, "application/vnd.android.package-archive");
+                        i.addFlags(
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(i);
+                      } catch (Exception e) {
+                        updateAsked = false;
+                        Toast.makeText(this, "अपडेट इंस्टॉल नहीं हो पाया", Toast.LENGTH_LONG).show();
+                      }
+                    });
+              } catch (Exception e) {
+                updateAsked = false;
+                runOnUiThread(
+                    () ->
+                        Toast.makeText(
+                                this, "अपडेट डाउनलोड नहीं हो पाया, नेट जाँचें", Toast.LENGTH_LONG)
+                            .show());
+              }
+            })
+        .start();
   }
 }
