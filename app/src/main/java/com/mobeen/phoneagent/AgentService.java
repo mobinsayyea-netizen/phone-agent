@@ -24,8 +24,10 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.TreeSet;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -49,19 +51,32 @@ public class AgentService extends AccessibilityService {
 
   private static final String SYS =
       "You control an Android phone for a visually impaired user through the Accessibility API. "
-          + "Every turn you get the user's TASK, a numbered list of the elements on the CURRENT "
-          + "screen (sometimes also a screenshot) and your previous steps. "
-          + "Reply with ONE JSON object and nothing else, in this shape: "
-          + "{\"actions\": [ {\"action\": ...}, ... ], \"part\": \"\"}. "
-          + "To save requests, put up to 4 actions in one reply ONLY when they all act on the "
-          + "CURRENT screen (for example typing into fields and then clicking the final button). "
-          + "Never put an action after one that opens a new screen, app, dialog or page: send that "
-          + "action alone and wait for the next turn. finish, fail and ask_user must be the only "
-          + "action in their reply. Each action has \"action\" (one of: click, long_click, tap_xy, "
-          + "type, ime_enter, scroll, global, open_app, open_settings, wait, screenshot, ask_user, "
-          + "finish, fail) plus its fields: "
-          + "\"index\" (element number from the CURRENT list, for click/long_click/type/scroll); "
-          + "\"text\" (for type); \"x\" and \"y\" (0-1000 across the screenshot, only for tap_xy); "
+          + "Every turn you get the user's TASK, your PLAN with done/todo marks, a numbered list of "
+          + "the elements on the CURRENT screen (sometimes also a screenshot) and your previous "
+          + "steps. Reply with ONE JSON object and nothing else, in this shape: "
+          + "{\"task_name\": \"\", \"plan\": [], \"done\": [], \"actions\": [ {\"action\": ...} ]}. "
+          + "FIRST reply only: give \"task_name\" (short name) and \"plan\": the smallest ordered list "
+          + "of short English steps (one per thing the user asked for, e.g. [\"Turn on TalkBack\", "
+          + "\"Increase brightness\"]). Later replies: leave plan and task_name out. "
+          + "\"done\": the 1-based numbers of plan steps that are completed once THIS reply's "
+          + "actions have run (cumulative: include earlier done numbers). When every plan step is in "
+          + "done, the app finishes by itself, so mark the last step done in the same reply as its "
+          + "final action. "
+          + "SCOPE: do exactly what the plan says and nothing else. Never open an app, setting or "
+          + "search that the task does not need. Never use search unless nothing else works. Do not "
+          + "re-check things that already worked. "
+          + "SPEED: every reply costs seconds, so put up to 4 actions in one reply when they all act "
+          + "on the CURRENT screen (e.g. type text then click the final button). Never put an action "
+          + "after one that opens a new screen, app, dialog or page: send it alone. finish, fail and "
+          + "ask_user must be the only action in their reply. Prefer direct routes: open_settings "
+          + "with the right page (TalkBack and other accessibility services: "
+          + "android.settings.ACCESSIBILITY_SETTINGS; brightness: android.settings.DISPLAY_SETTINGS "
+          + "or global quick_settings, then set_progress on the brightness slider), open_app for apps. "
+          + "Actions: click, long_click, tap_xy, type, ime_enter, scroll, set_progress, global, "
+          + "open_app, open_settings, wait, screenshot, ask_user, finish, fail. Fields: "
+          + "\"index\" (element number from the CURRENT list, for click/long_click/type/scroll/"
+          + "set_progress); \"text\" (for type); \"percent\" (0-100, for set_progress on an element "
+          + "that shows range=...); \"x\" and \"y\" (0-1000 across the screenshot, only for tap_xy); "
           + "\"direction\" (up/down/left/right, for scroll); "
           + "\"name\" (back/home/recents/notifications/quick_settings/lock, for global); "
           + "\"app\" (app name as shown on the launcher, for open_app); "
@@ -72,27 +87,21 @@ public class AgentService extends AccessibilityService {
           + "\"seconds\" (for wait); \"question\" (for ask_user); \"reason\" (for fail); "
           + "\"task_name\" and \"parts\" (for finish). "
           + "RULES: Element numbers change every step, use only the CURRENT list. If something is "
-          + "not where expected, look in other places (other menus, search, scrolling, other names "
-          + "for the same feature, e.g. TalkBack may be under Vision or Installed apps) before "
-          + "giving up. For a known settings page prefer open_settings. To open an app use "
-          + "open_app. After typing a message either use ime_enter or click the send button. If a "
-          + "button has no label and a screenshot is attached, use tap_xy. Use screenshot if the "
-          + "list is not enough to understand the screen. Never read out or reveal passwords. Do "
-          + "NOT do irreversible or financial things (payments, transfers, deleting data, factory "
+          + "not where expected, look in other places of the SAME area (other menus, scrolling, "
+          + "other names for the same feature, e.g. TalkBack may be under Vision or Installed apps). "
+          + "After typing a message either use ime_enter or click the send button. If a button has "
+          + "no label and a screenshot is attached, use tap_xy. Never read out or reveal passwords. "
+          + "Do NOT do irreversible or financial things (payments, transfers, deleting data, factory "
           + "reset, uninstalling apps) unless the task explicitly asks for exactly that. For OTP, "
           + "captcha, fingerprint or face unlock, payment confirmation, voice-model training or "
-          + "anything only the user can do, use ask_user. Use finish ONLY when the task is really "
-          + "done and you verified it on screen. \"part\": a very short phrase describing the "
-          + "sub-step you just completed, only when this reply finishes a meaningful sub-part of "
-          + "the task, otherwise an empty string. On finish give \"task_name\" (short name of the "
-          + "task) and \"parts\" (ordered array of 2 to 6 short phrases, one per sub-part that was "
-          + "accomplished). The user may speak Hindi or English, but ALWAYS write part, task_name, "
-          + "parts, question and reason in simple English.";
+          + "anything only the user can do, use ask_user. Write task_name, plan, parts, question "
+          + "and reason in simple English (the user may speak Hindi or English).";
 
   private final List<AccessibilityNodeInfo> nodes = new ArrayList<>();
   private final List<String> nodeSigs = new ArrayList<>();
   private Thread worker;
-  private long lastCall = 0;
+  private volatile long lastEvent = 0;
+  private final ArrayDeque<Long> callTimes = new ArrayDeque<>();
   private volatile boolean stopFlag;
   private volatile boolean wantShotNext;
   private volatile String currentPkg = "?";
@@ -128,7 +137,9 @@ public class AgentService extends AccessibilityService {
   }
 
   @Override
-  public void onAccessibilityEvent(AccessibilityEvent event) {}
+  public void onAccessibilityEvent(AccessibilityEvent event) {
+    lastEvent = System.currentTimeMillis();
+  }
 
   @Override
   public void onInterrupt() {}
@@ -205,6 +216,9 @@ public class AgentService extends AccessibilityService {
   private void runTask(String task, String key) throws Exception {
     List<String> history = new ArrayList<>();
     List<String> parts = new ArrayList<>();
+    List<String> plan = new ArrayList<>();
+    TreeSet<Integer> done = new TreeSet<>();
+    String taskName = "";
     String lastSig = "";
     int same = 0;
     int bad = 0;
@@ -213,7 +227,7 @@ public class AgentService extends AccessibilityService {
 
     publish("Working on it");
     performGlobalAction(GLOBAL_ACTION_HOME);
-    sleep(900);
+    waitIdle(400, 1500);
 
     for (int step = 1; step <= MAX_STEPS; step++) {
       if (stopFlag) return;
@@ -241,6 +255,15 @@ public class AgentService extends AccessibilityService {
 
       StringBuilder p = new StringBuilder();
       p.append("TASK: ").append(task).append('\n');
+      if (plan.isEmpty()) {
+        p.append("(No plan yet: in this reply also give task_name and plan.)\n");
+      } else {
+        p.append("YOUR PLAN (follow it, do nothing outside it):\n");
+        for (int i = 0; i < plan.size(); i++) {
+          p.append(i + 1).append(". ").append(done.contains(i + 1) ? "[done] " : "[todo] ")
+              .append(plan.get(i)).append('\n');
+        }
+      }
       p.append("STEP: ").append(step).append('/').append(MAX_STEPS).append('\n');
       p.append("CURRENT APP PACKAGE: ").append(currentPkg).append('\n');
       p.append("PREVIOUS STEPS:\n");
@@ -253,7 +276,7 @@ public class AgentService extends AccessibilityService {
 
       String reply = null;
       while (reply == null) {
-        pace(mi == 0 ? 6500 : 4500);
+        pace(mi == 0 ? 9 : 13);
         if (stopFlag) return;
         try {
           reply = Gemini.generate(key, Gemini.MODELS[mi], SYS, p.toString(), shot);
@@ -283,6 +306,22 @@ public class AgentService extends AccessibilityService {
           list.add(a);
         }
         if (list.isEmpty()) throw new Exception("no actions");
+        JSONArray pl = a.optJSONArray("plan");
+        if (plan.isEmpty() && pl != null) {
+          for (int i = 0; i < pl.length() && i < 8; i++) {
+            String t = pl.optString(i, "").trim();
+            if (!t.isEmpty()) plan.add(t);
+          }
+        }
+        String tn = a.optString("task_name", "").trim();
+        if (taskName.isEmpty() && !tn.isEmpty()) taskName = tn;
+        JSONArray dn = a.optJSONArray("done");
+        if (dn != null) {
+          for (int i = 0; i < dn.length(); i++) {
+            int v = dn.optInt(i, -1);
+            if (v >= 1) done.add(v);
+          }
+        }
       } catch (Exception e) {
         history.add(step + ". (your reply was invalid, answer with one JSON object with an actions array)");
         if (++bad >= 3) {
@@ -339,12 +378,18 @@ public class AgentService extends AccessibilityService {
           allOk = false;
           break;
         }
-        if (k < list.size() - 1) sleep(700);
+        if (k < list.size() - 1) waitIdle(250, 1200);
       }
-      String part = a.optString("part", "").trim();
-      if (allOk && !part.isEmpty()) parts.add(part);
+      boolean planComplete = !plan.isEmpty();
+      for (int i = 1; i <= plan.size(); i++) {
+        if (!done.contains(i)) planComplete = false;
+      }
+      if (allOk && planComplete) {
+        finishOk(taskName.isEmpty() ? task : taskName, plan);
+        return;
+      }
 
-      sleep(1300);
+      if (!stopFlag) waitIdle(300, 2500);
     }
     finishFail("it took too many steps");
   }
@@ -438,8 +483,9 @@ public class AgentService extends AccessibilityService {
     boolean ed = n.isEditable();
     boolean sc = n.isScrollable();
     boolean ch = n.isCheckable();
+    AccessibilityNodeInfo.RangeInfo ri = n.getRangeInfo();
     boolean has = notEmpty(t) || notEmpty(d) || notEmpty(h);
-    if (has || cl || ed || sc || ch) {
+    if (has || cl || ed || sc || ch || ri != null) {
       int idx = nodes.size();
       nodes.add(n);
       nodeSigs.add(sigOf(n));
@@ -451,6 +497,10 @@ public class AgentService extends AccessibilityService {
       }
       if (notEmpty(d)) sb.append(" desc=\"").append(clip(d)).append('"');
       if (notEmpty(h)) sb.append(" hint=\"").append(clip(h)).append('"');
+      if (ri != null) {
+        sb.append(" range=").append((int) ri.getMin()).append("..").append((int) ri.getMax())
+            .append(" current=").append((int) ri.getCurrent());
+      }
       if (cl) sb.append(" clickable");
       if (ed) sb.append(" editable");
       if (ch) sb.append(n.isChecked() ? " checked" : " unchecked");
@@ -478,10 +528,26 @@ public class AgentService extends AccessibilityService {
     return sigOf(n).equals(nodeSigs.get(idx));
   }
 
-  private void pace(long gapMs) {
-    long wait = lastCall + gapMs - System.currentTimeMillis();
-    if (wait > 0) sleep(wait);
-    lastCall = System.currentTimeMillis();
+  /** Waits only when we are about to exceed the per-minute request limit. */
+  private void pace(int perMinute) {
+    long now = System.currentTimeMillis();
+    while (!callTimes.isEmpty() && now - callTimes.peekFirst() > 60000) callTimes.pollFirst();
+    if (callTimes.size() >= perMinute) {
+      long wait = callTimes.peekFirst() + 60000 - now + 300;
+      if (wait > 0) sleep(wait);
+    }
+    callTimes.addLast(System.currentTimeMillis());
+  }
+
+  /** Waits until the screen stops changing (or maxMs), instead of a fixed long sleep. */
+  private void waitIdle(long minMs, long maxMs) {
+    long start = System.currentTimeMillis();
+    sleep(minMs);
+    while (!stopFlag
+        && System.currentTimeMillis() - start < maxMs
+        && System.currentTimeMillis() - lastEvent < 350) {
+      sleep(50);
+    }
   }
 
   private static boolean notEmpty(CharSequence c) {
@@ -618,6 +684,21 @@ public class AgentService extends AccessibilityService {
             p.lineTo(cx, y1);
           }
           return gesture(p, 400) ? "swiped " + dir : "scroll failed";
+        }
+      case "set_progress":
+        {
+          AccessibilityNodeInfo n = node(a);
+          if (n == null) return "ERROR: invalid element index";
+          AccessibilityNodeInfo.RangeInfo ri = n.getRangeInfo();
+          if (ri == null) return "ERROR: that element is not a slider";
+          double pct = Math.max(0, Math.min(100, a.optDouble("percent", 50)));
+          float v = (float) (ri.getMin() + (ri.getMax() - ri.getMin()) * pct / 100.0);
+          Bundle b = new Bundle();
+          b.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, v);
+          return n.performAction(
+                  AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(), b)
+              ? "slider set to " + (int) pct + "%"
+              : "set_progress failed";
         }
       case "global":
         return globalAction(a.optString("name", ""));

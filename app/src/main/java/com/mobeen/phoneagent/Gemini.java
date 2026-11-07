@@ -50,7 +50,10 @@ final class Gemini {
         new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)));
     body.put(
         "generationConfig",
-        new JSONObject().put("responseMimeType", "application/json").put("temperature", 0.2));
+        new JSONObject()
+            .put("responseMimeType", "application/json")
+            .put("temperature", 0.2)
+            .put("thinkingConfig", new JSONObject().put("thinkingBudget", 0)));
     byte[] payload = body.toString().getBytes("UTF-8");
 
     int tries429 = 0;
