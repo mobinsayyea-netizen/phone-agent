@@ -9,24 +9,28 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Minimal Gemini REST client (no external libraries). */
 final class Gemini {
-  static final String MODEL = "gemini-2.5-flash";
+  /** Tried in order. Each model has its own free quota, so we fall back when one runs out. */
+  static final String[] MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"};
 
   static class GeminiException extends Exception {
     final int code;
+    final boolean daily;
 
-    GeminiException(int code, String msg) {
+    GeminiException(int code, String msg, boolean daily) {
       super(msg);
       this.code = code;
+      this.daily = daily;
     }
   }
 
   private Gemini() {}
 
-  /** Sends one turn; returns the model's text (expected to be a JSON object). */
-  static String generate(String key, String system, String prompt, String jpegB64)
+  static String generate(String key, String model, String system, String prompt, String jpegB64)
       throws Exception {
     JSONObject body = new JSONObject();
     body.put(
@@ -49,14 +53,14 @@ final class Gemini {
         new JSONObject().put("responseMimeType", "application/json").put("temperature", 0.2));
     byte[] payload = body.toString().getBytes("UTF-8");
 
-    int attempt = 0;
+    int tries429 = 0;
+    int tries5xx = 0;
     while (true) {
-      attempt++;
       HttpURLConnection c =
           (HttpURLConnection)
               new URL(
                       "https://generativelanguage.googleapis.com/v1beta/models/"
-                          + MODEL
+                          + model
                           + ":generateContent")
                   .openConnection();
       c.setRequestMethod("POST");
@@ -75,23 +79,44 @@ final class Gemini {
       if (code >= 200 && code < 300) {
         return extractText(resp);
       }
-      if ((code == 429 || code == 500 || code == 503) && attempt < 4) {
-        Thread.sleep(attempt * 6000L);
+      String msg = errorMessage(resp);
+      if (code == 429) {
+        boolean daily = resp.contains("PerDay");
+        if (daily) throw new GeminiException(429, msg, true);
+        if (tries429 < 2) {
+          tries429++;
+          Thread.sleep(retryDelayMs(resp));
+          continue;
+        }
+        throw new GeminiException(429, msg, false);
+      }
+      if ((code == 500 || code == 503) && tries5xx < 2) {
+        tries5xx++;
+        Thread.sleep(5000);
         continue;
       }
-      throw new GeminiException(code, errorMessage(resp));
+      throw new GeminiException(code, msg, false);
     }
+  }
+
+  private static long retryDelayMs(String resp) {
+    Matcher m = Pattern.compile("\"retryDelay\"\\s*:\\s*\"(\\d+)").matcher(resp);
+    if (m.find()) {
+      long s = Long.parseLong(m.group(1)) + 2;
+      return Math.min(65L, s) * 1000L;
+    }
+    return 20000L;
   }
 
   private static String extractText(String resp) throws Exception {
     JSONObject r = new JSONObject(resp);
     JSONArray cands = r.optJSONArray("candidates");
     if (cands == null || cands.length() == 0) {
-      throw new GeminiException(400, "empty response");
+      throw new GeminiException(400, "empty response", false);
     }
     JSONObject content = cands.getJSONObject(0).optJSONObject("content");
     if (content == null) {
-      throw new GeminiException(400, "no content");
+      throw new GeminiException(400, "no content", false);
     }
     JSONArray ps = content.optJSONArray("parts");
     StringBuilder sb = new StringBuilder();

@@ -1,5 +1,5 @@
-# फ़ोन एजेंट (Phone Agent)
+# Phone Agent
 
-पूरे फ़ोन के लिए एक AI एजेंट: Accessibility Service + Gemini API।
-आदेश लिखकर या बोलकर दें; काम पूरा होने पर एजेंट बोलकर बताता है कि क्या-क्या हुआ।
-APK Builder (`com.mobeen.apkbuilder`) को यह पहचान सकता है।
+An AI agent for the whole phone: Accessibility Service + Gemini API.
+Give a command by typing or speaking. It works silently and, when finished, speaks which parts of the task were done.
+Builds are signed with a permanent key (repo secrets), so every new APK installs over the old one.

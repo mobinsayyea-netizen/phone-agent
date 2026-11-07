@@ -51,9 +51,15 @@ public class AgentService extends AccessibilityService {
       "You control an Android phone for a visually impaired user through the Accessibility API. "
           + "Every turn you get the user's TASK, a numbered list of the elements on the CURRENT "
           + "screen (sometimes also a screenshot) and your previous steps. "
-          + "Reply with ONE JSON object and nothing else. Fields: "
-          + "\"action\" (one of: click, long_click, tap_xy, type, ime_enter, scroll, global, "
-          + "open_app, open_settings, wait, screenshot, ask_user, finish, fail); "
+          + "Reply with ONE JSON object and nothing else, in this shape: "
+          + "{\"actions\": [ {\"action\": ...}, ... ], \"part\": \"\"}. "
+          + "To save requests, put up to 4 actions in one reply ONLY when they all act on the "
+          + "CURRENT screen (for example typing into fields and then clicking the final button). "
+          + "Never put an action after one that opens a new screen, app, dialog or page: send that "
+          + "action alone and wait for the next turn. finish, fail and ask_user must be the only "
+          + "action in their reply. Each action has \"action\" (one of: click, long_click, tap_xy, "
+          + "type, ime_enter, scroll, global, open_app, open_settings, wait, screenshot, ask_user, "
+          + "finish, fail) plus its fields: "
           + "\"index\" (element number from the CURRENT list, for click/long_click/type/scroll); "
           + "\"text\" (for type); \"x\" and \"y\" (0-1000 across the screenshot, only for tap_xy); "
           + "\"direction\" (up/down/left/right, for scroll); "
@@ -64,26 +70,29 @@ public class AgentService extends AccessibilityService {
           + "android.settings.WIFI_SETTINGS, android.settings.BLUETOOTH_SETTINGS, "
           + "android.settings.SOUND_SETTINGS, android.settings.APPLICATION_SETTINGS); "
           + "\"seconds\" (for wait); \"question\" (for ask_user); \"reason\" (for fail); "
-          + "\"part\" (optional); \"task_name\" and \"parts\" (for finish). "
-          + "RULES: One action per turn. Element numbers change every step, use only the CURRENT "
-          + "list. If something is not where expected, look in other places (other menus, search, "
-          + "scrolling, other names for the same feature, e.g. TalkBack may be under Vision or "
-          + "Installed apps) before giving up. For a known settings page prefer open_settings. "
-          + "To open an app use open_app. After typing a message either use ime_enter or click "
-          + "the send button. If a button has no label and a screenshot is attached, use tap_xy. "
-          + "Use screenshot if the list is not enough to understand the screen. "
-          + "Never read out or reveal passwords. Do NOT do irreversible or financial things "
-          + "(payments, transfers, deleting data, factory reset, uninstalling apps) unless the "
-          + "task explicitly asks for exactly that. For OTP, captcha, fingerprint or face unlock, "
-          + "payment confirmation, voice-model training or anything only the user can do, use "
-          + "ask_user. Use finish ONLY when the task is really done and you verified it on screen. "
-          + "\"part\": a very short phrase describing the sub-step you just completed, only when "
-          + "this step finishes a meaningful sub-part of the task, otherwise an empty string. "
-          + "On finish give \"task_name\" (short name of the task) and \"parts\" (ordered array of "
-          + "2 to 6 short phrases, one per sub-part that was accomplished). Write part, task_name, "
-          + "parts, question and reason in the same language as the user's task.";
+          + "\"task_name\" and \"parts\" (for finish). "
+          + "RULES: Element numbers change every step, use only the CURRENT list. If something is "
+          + "not where expected, look in other places (other menus, search, scrolling, other names "
+          + "for the same feature, e.g. TalkBack may be under Vision or Installed apps) before "
+          + "giving up. For a known settings page prefer open_settings. To open an app use "
+          + "open_app. After typing a message either use ime_enter or click the send button. If a "
+          + "button has no label and a screenshot is attached, use tap_xy. Use screenshot if the "
+          + "list is not enough to understand the screen. Never read out or reveal passwords. Do "
+          + "NOT do irreversible or financial things (payments, transfers, deleting data, factory "
+          + "reset, uninstalling apps) unless the task explicitly asks for exactly that. For OTP, "
+          + "captcha, fingerprint or face unlock, payment confirmation, voice-model training or "
+          + "anything only the user can do, use ask_user. Use finish ONLY when the task is really "
+          + "done and you verified it on screen. \"part\": a very short phrase describing the "
+          + "sub-step you just completed, only when this reply finishes a meaningful sub-part of "
+          + "the task, otherwise an empty string. On finish give \"task_name\" (short name of the "
+          + "task) and \"parts\" (ordered array of 2 to 6 short phrases, one per sub-part that was "
+          + "accomplished). The user may speak Hindi or English, but ALWAYS write part, task_name, "
+          + "parts, question and reason in simple English.";
 
   private final List<AccessibilityNodeInfo> nodes = new ArrayList<>();
+  private final List<String> nodeSigs = new ArrayList<>();
+  private Thread worker;
+  private long lastCall = 0;
   private volatile boolean stopFlag;
   private volatile boolean wantShotNext;
   private volatile String currentPkg = "?";
@@ -103,7 +112,7 @@ public class AgentService extends AccessibilityService {
             this,
             st -> {
               if (st == TextToSpeech.SUCCESS) {
-                int r = tts.setLanguage(new Locale("hi", "IN"));
+                int r = tts.setLanguage(Locale.ENGLISH);
                 if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
                   tts.setLanguage(Locale.getDefault());
                 }
@@ -115,7 +124,7 @@ public class AgentService extends AccessibilityService {
                 ttsReady = true;
               }
             });
-    publish("तैयार है। आदेश लिखें या बोलें।");
+    publish("Ready. Type or speak a command.");
   }
 
   @Override
@@ -157,7 +166,7 @@ public class AgentService extends AccessibilityService {
       volDown = pressed;
     }
     if (volUp && volDown && running) {
-      stopTask("आपातकालीन रोक। काम बंद कर दिया गया।");
+      stopTask("Emergency stop. The task was stopped.");
     }
     return false;
   }
@@ -168,22 +177,25 @@ public class AgentService extends AccessibilityService {
     if (running) return false;
     running = true;
     stopFlag = false;
-    new Thread(
+    worker =
+        new Thread(
             () -> {
               try {
                 runTask(task, key);
               } catch (Throwable t) {
-                finishFail("कोई त्रुटि आई: " + t.getClass().getSimpleName());
+                if (!stopFlag) finishFail("something went wrong (" + t.getClass().getSimpleName() + ")");
               } finally {
                 running = false;
               }
-            })
-        .start();
+            });
+    worker.start();
     return true;
   }
 
   void stopTask(String message) {
     stopFlag = true;
+    Thread w = worker;
+    if (w != null) w.interrupt();
     publish(message);
     speak(message);
   }
@@ -196,9 +208,10 @@ public class AgentService extends AccessibilityService {
     String lastSig = "";
     int same = 0;
     int bad = 0;
+    int mi = 0;
     wantShotNext = false;
 
-    publish("काम चल रहा है");
+    publish("Working on it");
     performGlobalAction(GLOBAL_ACTION_HOME);
     sleep(900);
 
@@ -238,31 +251,53 @@ public class AgentService extends AccessibilityService {
       if (shot != null) p.append("\n(A screenshot of the current screen is attached.)");
       p.append(hint);
 
-      String reply;
-      try {
-        reply = Gemini.generate(key, SYS, p.toString(), shot);
-      } catch (Gemini.GeminiException e) {
-        finishFail(friendly(e));
-        return;
+      String reply = null;
+      while (reply == null) {
+        pace(mi == 0 ? 6500 : 4500);
+        if (stopFlag) return;
+        try {
+          reply = Gemini.generate(key, Gemini.MODELS[mi], SYS, p.toString(), shot);
+        } catch (Gemini.GeminiException e) {
+          if (stopFlag) return;
+          if (e.code == 429 && mi + 1 < Gemini.MODELS.length) {
+            mi++;
+            continue;
+          }
+          finishFail(friendly(e));
+          return;
+        }
       }
       if (stopFlag) return;
 
       JSONObject a;
+      List<JSONObject> list = new ArrayList<>();
       try {
         a = parseJson(reply);
+        JSONArray acts = a.optJSONArray("actions");
+        if (acts != null) {
+          for (int i = 0; i < acts.length() && i < 4; i++) {
+            JSONObject o = acts.optJSONObject(i);
+            if (o != null) list.add(o);
+          }
+        } else if (a.has("action")) {
+          list.add(a);
+        }
+        if (list.isEmpty()) throw new Exception("no actions");
       } catch (Exception e) {
-        history.add(step + ". (your reply was not valid JSON, answer with one JSON object)");
+        history.add(step + ". (your reply was invalid, answer with one JSON object with an actions array)");
         if (++bad >= 3) {
-          finishFail("AI का जवाब समझ नहीं आया");
+          finishFail("the AI gave an answer I could not understand");
           return;
         }
         continue;
       }
 
-      String action = a.optString("action", "");
-      if (action.equals("finish")) {
+      JSONObject first = list.get(0);
+      String fa = first.optString("action", "");
+      if (fa.equals("finish")) {
         List<String> fin = new ArrayList<>();
-        JSONArray arr = a.optJSONArray("parts");
+        JSONArray arr = first.optJSONArray("parts");
+        if (arr == null) arr = a.optJSONArray("parts");
         if (arr != null) {
           for (int i = 0; i < arr.length(); i++) {
             String s = arr.optString(i, "").trim();
@@ -270,46 +305,61 @@ public class AgentService extends AccessibilityService {
           }
         }
         if (fin.isEmpty()) fin = parts;
-        String name = a.optString("task_name", "").trim();
+        String name = first.optString("task_name", a.optString("task_name", "")).trim();
         if (name.isEmpty()) name = task;
         finishOk(name, fin);
         return;
       }
-      if (action.equals("fail")) {
-        finishFail(a.optString("reason", "काम पूरा नहीं हो सका"));
+      if (fa.equals("fail")) {
+        finishFail(first.optString("reason", a.optString("reason", "the task could not be completed")));
         return;
       }
-      if (action.equals("ask_user")) {
-        String q = a.optString("question", "आपकी मदद चाहिए");
-        String m = q + " यह आपको खुद करना होगा। हो जाने पर फिर से आदेश दें।";
+      if (fa.equals("ask_user")) {
+        String q = first.optString("question", a.optString("question", "I need your help"));
+        String m = q + " Please do this yourself, then give the command again.";
         publish(m);
         speak(m);
         return;
       }
 
-      String result = execute(a);
-      String part = a.optString("part", "").trim();
-      if (!part.isEmpty() && !result.startsWith("ERROR") && !result.contains("failed")) {
-        parts.add(part);
+      boolean allOk = true;
+      for (int k = 0; k < list.size(); k++) {
+        JSONObject o = list.get(k);
+        String act = o.optString("action", "");
+        if (act.equals("finish") || act.equals("fail") || act.equals("ask_user")) break;
+        if (k > 0 && o.has("index") && !stillValid(o.optInt("index", -1))) {
+          history.add(step + "." + (k + 1) + " (skipped: the screen changed, look again)");
+          allOk = false;
+          break;
+        }
+        if (stopFlag) return;
+        String result = execute(o);
+        history.add(step + "." + (k + 1) + " " + compact(o) + " -> " + result);
+        if (result.startsWith("ERROR") || result.contains("failed")) {
+          allOk = false;
+          break;
+        }
+        if (k < list.size() - 1) sleep(700);
       }
-      history.add(step + ". " + compact(a) + " -> " + result);
+      String part = a.optString("part", "").trim();
+      if (allOk && !part.isEmpty()) parts.add(part);
 
-      if (!action.equals("wait")) sleep(1500);
+      sleep(1300);
     }
-    finishFail("काम पूरा करने में बहुत ज़्यादा कदम लग गए");
+    finishFail("it took too many steps");
   }
 
   // ---------- finishing / speaking ----------
 
-  private static final String[] ORD = {"पहला", "दूसरा", "तीसरा", "चौथा", "पाँचवाँ", "छठा"};
+  private static final String[] ORD = {"First", "Second", "Third", "Fourth", "Fifth", "Sixth"};
 
   private void finishOk(String name, List<String> parts) {
-    StringBuilder s = new StringBuilder("आपका काम सफलतापूर्वक पूरा हो गया: ").append(name).append("। ");
+    StringBuilder s = new StringBuilder("Your task was completed successfully: ").append(name).append(". ");
     if (!parts.isEmpty()) {
-      s.append("इसके भाग ये थे। ");
+      s.append("It had these parts. ");
       for (int i = 0; i < parts.size(); i++) {
-        String o = i < ORD.length ? ORD[i] : ("भाग " + (i + 1));
-        s.append(o).append(": ").append(parts.get(i)).append("। ");
+        String o = i < ORD.length ? ORD[i] : ("Part " + (i + 1));
+        s.append(o).append(": ").append(parts.get(i)).append(". ");
       }
     }
     String msg = s.toString();
@@ -318,17 +368,30 @@ public class AgentService extends AccessibilityService {
   }
 
   private void finishFail(String reason) {
-    String msg = "काम पूरा नहीं हो सका: " + reason;
+    String msg = "The task could not be completed: " + reason;
     publish(msg);
     speak(msg);
   }
 
   private String friendly(Gemini.GeminiException e) {
-    if (e.code == 400 || e.code == 401 || e.code == 403) {
-      return "Gemini API key सही नहीं है या उसे अनुमति नहीं है";
+    if (e.code == 429) {
+      if (e.daily) {
+        return "the daily free Gemini limit is used up for this key's Google project (it resets at"
+            + " midnight Pacific time, about 1:30 PM in India). Other apps using the same key or"
+            + " project also use this limit.";
+      }
+      return "the per-minute Gemini limit was reached. Wait one minute and try again.";
     }
-    if (e.code == 429) return "Gemini की सीमा पूरी हो गई है, थोड़ी देर बाद कोशिश करें";
-    return "Gemini से जवाब नहीं मिला";
+    if (e.code == 400 || e.code == 401 || e.code == 403) {
+      return "the Gemini API key is not valid or is not allowed (" + clipMsg(e.getMessage()) + ")";
+    }
+    return "Gemini error " + e.code + ": " + clipMsg(e.getMessage());
+  }
+
+  private static String clipMsg(String m) {
+    if (m == null) return "";
+    String s = m.replace('\n', ' ').trim();
+    return s.length() > 140 ? s.substring(0, 140) : s;
   }
 
   private void publish(String s) {
@@ -347,6 +410,7 @@ public class AgentService extends AccessibilityService {
 
   private String readScreen() {
     nodes.clear();
+    nodeSigs.clear();
     AccessibilityNodeInfo root = null;
     for (int i = 0; i < 6; i++) {
       root = getRootInActiveWindow();
@@ -378,6 +442,7 @@ public class AgentService extends AccessibilityService {
     if (has || cl || ed || sc || ch) {
       int idx = nodes.size();
       nodes.add(n);
+      nodeSigs.add(sigOf(n));
       sb.append('[').append(idx).append("] ").append(shortClass(n.getClassName()));
       if (n.isPassword()) {
         sb.append(" (password field)");
@@ -396,6 +461,27 @@ public class AgentService extends AccessibilityService {
     for (int i = 0; i < n.getChildCount(); i++) {
       walk(n.getChild(i), depth + 1, sb);
     }
+  }
+
+  private static String sigOf(AccessibilityNodeInfo n) {
+    return shortClass(n.getClassName()) + "|" + n.getText() + "|" + n.getContentDescription();
+  }
+
+  private boolean stillValid(int idx) {
+    if (idx < 0 || idx >= nodes.size()) return false;
+    AccessibilityNodeInfo n = nodes.get(idx);
+    try {
+      if (!n.refresh()) return false;
+    } catch (Exception e) {
+      return false;
+    }
+    return sigOf(n).equals(nodeSigs.get(idx));
+  }
+
+  private void pace(long gapMs) {
+    long wait = lastCall + gapMs - System.currentTimeMillis();
+    if (wait > 0) sleep(wait);
+    lastCall = System.currentTimeMillis();
   }
 
   private static boolean notEmpty(CharSequence c) {
