@@ -227,6 +227,19 @@ public class AgentService extends AccessibilityService {
     List<String> models = new ArrayList<>();
     if (prov.equals("gemini")) {
       models.addAll(Gemini.pickModels(key));
+      // Same generation as the Vision assistant's Gemini model (3.1): try it first.
+      for (int i = 0; i < models.size(); i++) {
+        if (models.get(i).contains("3.1-flash")) {
+          models.add(0, models.remove(i));
+          break;
+        }
+      }
+      // A model typed in the app's settings always goes first.
+      String forced = getSharedPreferences("agent", MODE_PRIVATE).getString("model", "").trim();
+      if (!forced.isEmpty()) {
+        models.remove(forced);
+        models.add(0, forced);
+      }
     } else {
       models.add(prov.equals("deepseek") ? Gemini.DEEPSEEK_MODEL : Gemini.OPENAI_MODEL);
     }
@@ -296,7 +309,7 @@ public class AgentService extends AccessibilityService {
             mi++;
             continue;
           }
-          finishFail(friendly(e));
+          finishFail(friendly(e) + " (model: " + models.get(mi) + ")");
           return;
         }
       }
