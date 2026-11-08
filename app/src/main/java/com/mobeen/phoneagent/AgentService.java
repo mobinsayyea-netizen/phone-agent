@@ -223,7 +223,13 @@ public class AgentService extends AccessibilityService {
     int same = 0;
     int bad = 0;
     int mi = 0;
-    List<String> models = Gemini.pickModels(key);
+    String prov = Gemini.detect(key);
+    List<String> models = new ArrayList<>();
+    if (prov.equals("gemini")) {
+      models.addAll(Gemini.pickModels(key));
+    } else {
+      models.add(prov.equals("deepseek") ? Gemini.DEEPSEEK_MODEL : Gemini.OPENAI_MODEL);
+    }
     wantShotNext = false;
 
     publish("Working on it");
@@ -280,10 +286,13 @@ public class AgentService extends AccessibilityService {
         pace(mi == 0 ? 9 : 13);
         if (stopFlag) return;
         try {
-          reply = Gemini.generate(key, models.get(mi), SYS, p.toString(), shot);
+          reply =
+              prov.equals("gemini")
+                  ? Gemini.generate(key, models.get(mi), SYS, p.toString(), shot)
+                  : Gemini.generateOai(prov, key, SYS, p.toString(), shot);
         } catch (Gemini.GeminiException e) {
           if (stopFlag) return;
-          if ((e.code == 429 || e.modelProblem) && mi + 1 < models.size()) {
+          if ((e.code == 429 || e.code >= 500 || e.modelProblem) && mi + 1 < models.size()) {
             mi++;
             continue;
           }
@@ -428,11 +437,17 @@ public class AgentService extends AccessibilityService {
       }
       return "the per-minute Gemini limit was reached. Wait one minute and try again.";
     }
+    if (e.code == 599) {
+      return "the AI took too long to answer. Check your internet and try again.";
+    }
+    if (e.code >= 500) {
+      return "the AI server had a problem (" + e.code + "). Try again in a minute.";
+    }
     if (e.modelProblem) {
       return "none of the available Gemini models worked for this key (" + clipMsg(e.getMessage()) + ")";
     }
     if (e.code == 400 || e.code == 401 || e.code == 403) {
-      return "the Gemini API key is not valid or is not allowed (" + clipMsg(e.getMessage()) + ")";
+      return "the API key is not valid or is not allowed (" + clipMsg(e.getMessage()) + ")";
     }
     return "Gemini error " + e.code + ": " + clipMsg(e.getMessage());
   }

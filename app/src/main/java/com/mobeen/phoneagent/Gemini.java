@@ -51,6 +51,79 @@ final class Gemini {
 
   private Gemini() {}
 
+  static final String DEEPSEEK_MODEL = "deepseek-v4-flash-vision-exp";
+  static final String OPENAI_MODEL = "gpt-4o-mini";
+
+  /** Same key rules as the Vision assistant app: AIza = Gemini, sk-<32 hex> = DeepSeek, sk- = OpenAI. */
+  static String detect(String k) {
+    k = k.trim();
+    if (k.matches("^AIza.*")) return "gemini";
+    if (k.matches("(?i)^sk-[a-f0-9]{32}$")) return "deepseek";
+    if (k.startsWith("sk-")) return "openai";
+    return "gemini";
+  }
+
+  /** DeepSeek / OpenAI style chat completions with an optional screenshot. */
+  static String generateOai(String provider, String key, String system, String prompt, String jpegB64)
+      throws Exception {
+    boolean ds = provider.equals("deepseek");
+    String url = ds ? "https://api.deepseek.com/chat/completions" : "https://api.openai.com/v1/chat/completions";
+    String model = ds ? DEEPSEEK_MODEL : OPENAI_MODEL;
+    JSONArray content = new JSONArray();
+    content.put(new JSONObject().put("type", "text").put("text", prompt));
+    if (jpegB64 != null) {
+      content.put(
+          new JSONObject()
+              .put("type", "image_url")
+              .put("image_url", new JSONObject().put("url", "data:image/jpeg;base64," + jpegB64)));
+    }
+    JSONObject body = new JSONObject();
+    body.put("model", model);
+    body.put(
+        "messages",
+        new JSONArray()
+            .put(new JSONObject().put("role", "system").put("content", system))
+            .put(new JSONObject().put("role", "user").put("content", jpegB64 == null ? prompt : content)));
+    body.put("max_tokens", 700);
+    byte[] data = body.toString().getBytes("UTF-8");
+    int tries = 0;
+    while (true) {
+      try {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST");
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(50000);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setRequestProperty("Authorization", "Bearer " + key);
+        c.setDoOutput(true);
+        try (OutputStream os = c.getOutputStream()) {
+          os.write(data);
+        }
+        int code = c.getResponseCode();
+        String resp = read(code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream());
+        c.disconnect();
+        if (code >= 200 && code < 300) {
+          JSONArray ch = new JSONObject(resp).optJSONArray("choices");
+          if (ch == null || ch.length() == 0) throw new GeminiException(400, "empty response", false);
+          return ch.getJSONObject(0).getJSONObject("message").optString("content", "");
+        }
+        String msg = errorMessage(resp);
+        if ((code == 429 || code >= 500) && tries < 2) {
+          tries++;
+          Thread.sleep(code == 429 ? 8000 : 4000);
+          continue;
+        }
+        throw new GeminiException(code, msg, false);
+      } catch (java.io.IOException e) {
+        if (tries < 1) {
+          tries++;
+          continue;
+        }
+        throw new GeminiException(599, "the AI took too long or the connection failed", false);
+      }
+    }
+  }
+
   // ---------- model discovery ----------
 
   /** Asks the API which models this key can use and returns the best ones, best first. */
@@ -168,45 +241,53 @@ final class Gemini {
     int tries5xx = 0;
     while (true) {
       byte[] data = payload(model, system, prompt, jpegB64);
-      HttpURLConnection c =
-          (HttpURLConnection) new URL(BASE + "models/" + model + ":generateContent").openConnection();
-      c.setRequestMethod("POST");
-      c.setConnectTimeout(20000);
-      c.setReadTimeout(90000);
-      c.setRequestProperty("Content-Type", "application/json");
-      c.setRequestProperty("x-goog-api-key", key);
-      c.setDoOutput(true);
-      try (OutputStream os = c.getOutputStream()) {
-        os.write(data);
-      }
-      int code = c.getResponseCode();
-      InputStream is = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
-      String resp = read(is);
-      c.disconnect();
-      if (code >= 200 && code < 300) {
-        return extractText(resp);
-      }
-      String msg = errorMessage(resp);
-      if (code == 400 && msg.toLowerCase().contains("thinking") && !noThinking.contains(model)) {
-        noThinking.add(model); // this model rejects our thinking setting: retry without it
-        continue;
-      }
-      if (code == 429) {
-        boolean daily = resp.contains("PerDay");
-        if (daily) throw new GeminiException(429, msg, true);
-        if (tries429 < 2) {
-          tries429++;
-          Thread.sleep(retryDelayMs(resp));
+      try {
+        HttpURLConnection c =
+            (HttpURLConnection) new URL(BASE + "models/" + model + ":generateContent").openConnection();
+        c.setRequestMethod("POST");
+        c.setConnectTimeout(20000);
+        c.setReadTimeout(50000);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setRequestProperty("x-goog-api-key", key);
+        c.setDoOutput(true);
+        try (OutputStream os = c.getOutputStream()) {
+          os.write(data);
+        }
+        int code = c.getResponseCode();
+        InputStream is = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
+        String resp = read(is);
+        c.disconnect();
+        if (code >= 200 && code < 300) {
+          return extractText(resp);
+        }
+        String msg = errorMessage(resp);
+        if (code == 400 && msg.toLowerCase().contains("thinking") && !noThinking.contains(model)) {
+          noThinking.add(model); // this model rejects our thinking setting: retry without it
           continue;
         }
-        throw new GeminiException(429, msg, false);
+        if (code == 429) {
+          boolean daily = resp.contains("PerDay");
+          if (daily) throw new GeminiException(429, msg, true);
+          if (tries429 < 2) {
+            tries429++;
+            Thread.sleep(retryDelayMs(resp));
+            continue;
+          }
+          throw new GeminiException(429, msg, false);
+        }
+        if ((code == 500 || code == 503) && tries5xx < 2) {
+          tries5xx++;
+          Thread.sleep(5000);
+          continue;
+        }
+        throw new GeminiException(code, msg, false);
+      } catch (java.io.IOException e) {
+        if (tries5xx < 1) {
+          tries5xx++;
+          continue;
+        }
+        throw new GeminiException(599, "the AI took too long or the connection failed", false);
       }
-      if ((code == 500 || code == 503) && tries5xx < 2) {
-        tries5xx++;
-        Thread.sleep(5000);
-        continue;
-      }
-      throw new GeminiException(code, msg, false);
     }
   }
 

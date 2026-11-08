@@ -85,7 +85,7 @@ public class MainActivity extends Activity {
 
     // API key area: shown only until a key is saved. Afterwards only "Change API key" remains.
     keyBox = new EditText(this);
-    keyBox.setHint("Gemini API key");
+    keyBox.setHint("API key (Gemini or DeepSeek)");
     keyBox.setTextSize(18);
     keyBox.setSingleLine(true);
     keyBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
@@ -161,7 +161,7 @@ public class MainActivity extends Activity {
 
   private void showKeyEditor() {
     keyBox.setText("");
-    keyBox.setHint(savedKey().isEmpty() ? "Gemini API key" : "Enter new Gemini API key");
+    keyBox.setHint(savedKey().isEmpty() ? "API key (Gemini or DeepSeek)" : "Enter new API key");
     keyBox.setVisibility(View.VISIBLE);
     keyRow.setVisibility(View.VISIBLE);
     cancelBtn.setVisibility(savedKey().isEmpty() ? View.GONE : View.VISIBLE);
@@ -248,7 +248,7 @@ public class MainActivity extends Activity {
     String key = savedKey();
     if (key.isEmpty()) {
       showKeyEditor();
-      setStatus("Enter your Gemini API key and tap Save first");
+      setStatus("Enter your API key and tap Save first");
       return;
     }
     AgentService svc = AgentService.instance;
