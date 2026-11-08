@@ -23,8 +23,11 @@ final class Gemini {
 
   /** Used only if the live model list cannot be fetched. */
   private static final String[] FALLBACK = {
-    "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash-lite"
+    "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"
   };
+
+  /** The model that already works well in the user's AudioToText app. */
+  private static final String PREFERRED = "gemini-3.5-flash-lite";
 
   private static List<String> cached;
   private static String cachedFor = "";
@@ -50,79 +53,6 @@ final class Gemini {
   }
 
   private Gemini() {}
-
-  static final String DEEPSEEK_MODEL = "deepseek-v4-flash-vision-exp";
-  static final String OPENAI_MODEL = "gpt-4o-mini";
-
-  /** Same key rules as the Vision assistant app: AIza = Gemini, sk-<32 hex> = DeepSeek, sk- = OpenAI. */
-  static String detect(String k) {
-    k = k.trim();
-    if (k.matches("^AIza.*")) return "gemini";
-    if (k.matches("(?i)^sk-[a-f0-9]{32}$")) return "deepseek";
-    if (k.startsWith("sk-")) return "openai";
-    return "gemini";
-  }
-
-  /** DeepSeek / OpenAI style chat completions with an optional screenshot. */
-  static String generateOai(String provider, String key, String system, String prompt, String jpegB64)
-      throws Exception {
-    boolean ds = provider.equals("deepseek");
-    String url = ds ? "https://api.deepseek.com/chat/completions" : "https://api.openai.com/v1/chat/completions";
-    String model = ds ? DEEPSEEK_MODEL : OPENAI_MODEL;
-    JSONArray content = new JSONArray();
-    content.put(new JSONObject().put("type", "text").put("text", prompt));
-    if (jpegB64 != null) {
-      content.put(
-          new JSONObject()
-              .put("type", "image_url")
-              .put("image_url", new JSONObject().put("url", "data:image/jpeg;base64," + jpegB64)));
-    }
-    JSONObject body = new JSONObject();
-    body.put("model", model);
-    body.put(
-        "messages",
-        new JSONArray()
-            .put(new JSONObject().put("role", "system").put("content", system))
-            .put(new JSONObject().put("role", "user").put("content", jpegB64 == null ? prompt : content)));
-    body.put("max_tokens", 700);
-    byte[] data = body.toString().getBytes("UTF-8");
-    int tries = 0;
-    while (true) {
-      try {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setRequestMethod("POST");
-        c.setConnectTimeout(15000);
-        c.setReadTimeout(50000);
-        c.setRequestProperty("Content-Type", "application/json");
-        c.setRequestProperty("Authorization", "Bearer " + key);
-        c.setDoOutput(true);
-        try (OutputStream os = c.getOutputStream()) {
-          os.write(data);
-        }
-        int code = c.getResponseCode();
-        String resp = read(code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream());
-        c.disconnect();
-        if (code >= 200 && code < 300) {
-          JSONArray ch = new JSONObject(resp).optJSONArray("choices");
-          if (ch == null || ch.length() == 0) throw new GeminiException(400, "empty response", false);
-          return ch.getJSONObject(0).getJSONObject("message").optString("content", "");
-        }
-        String msg = errorMessage(resp);
-        if ((code == 429 || code >= 500) && tries < 2) {
-          tries++;
-          Thread.sleep(code == 429 ? 8000 : 4000);
-          continue;
-        }
-        throw new GeminiException(code, msg, false);
-      } catch (java.io.IOException e) {
-        if (tries < 1) {
-          tries++;
-          continue;
-        }
-        throw new GeminiException(599, "the AI took too long or the connection failed", false);
-      }
-    }
-  }
 
   // ---------- model discovery ----------
 
@@ -168,6 +98,12 @@ final class Gemini {
         if (token.isEmpty()) break;
       }
       Collections.sort(found, (x, y) -> y[1].compareTo(x[1]));
+      for (String[] f : found) {
+        if (f[0].equals(PREFERRED)) {
+          result.add(f[0]);
+          break;
+        }
+      }
       for (String[] f : found) {
         if (!result.contains(f[0])) result.add(f[0]);
         if (result.size() >= 4) break;

@@ -49,6 +49,24 @@ public class AgentService extends AccessibilityService {
 
   private static final int MAX_STEPS = 40;
 
+  private static final String EXTRA =
+      " EXTRA ACTIONS: open_url (field url, https only; optional field package, for example "
+          + "com.android.chrome for the Chrome browser or com.google.android.youtube for the "
+          + "YouTube app) opens a web page or link directly, which is much faster than typing "
+          + "into a browser or a search box. speak (field text, and field lang = en or hi for the "
+          + "language of the text) says text aloud to the user. Use speak ONLY when the user's "
+          + "task asks you to tell, read or summarize something; never use it to narrate your own "
+          + "steps. NEWS: for a request like telling the tech news in Chrome, use open_url with a "
+          + "news page in Chrome (for example https://news.google.com/search?q=tech%20news or a "
+          + "tech news site), read the headlines from SCREEN ELEMENTS (scroll once or twice if "
+          + "needed), then speak a short clear summary of the top five or so headlines and mark "
+          + "that plan step done in the same reply. VIDEOS: to play something on YouTube use "
+          + "open_url with https://www.youtube.com/results?search_query=<url-encoded words> and "
+          + "package com.google.android.youtube, click the first result that clearly matches the "
+          + "title the user said, and if an ad shows a Skip button, click it. Dismiss cookie, "
+          + "consent or sign-in pop-ups by choosing the option that closes them (No thanks, Not "
+          + "now, Reject, Close).";
+
   private static final String SYS =
       "You control an Android phone for a visually impaired user through the Accessibility API. "
           + "Every turn you get the user's TASK, your PLAN with done/todo marks, a numbered list of "
@@ -95,7 +113,7 @@ public class AgentService extends AccessibilityService {
           + "reset, uninstalling apps) unless the task explicitly asks for exactly that. For OTP, "
           + "captcha, fingerprint or face unlock, payment confirmation, voice-model training or "
           + "anything only the user can do, use ask_user. Write task_name, plan, parts, question "
-          + "and reason in simple English (the user may speak Hindi or English).";
+          + "and reason in simple English (the user may speak Hindi or English)." + EXTRA;
 
   private final List<AccessibilityNodeInfo> nodes = new ArrayList<>();
   private final List<String> nodeSigs = new ArrayList<>();
@@ -223,25 +241,16 @@ public class AgentService extends AccessibilityService {
     int same = 0;
     int bad = 0;
     int mi = 0;
-    String prov = Gemini.detect(key);
-    List<String> models = new ArrayList<>();
-    if (prov.equals("gemini")) {
-      models.addAll(Gemini.pickModels(key));
-      // Same generation as the Vision assistant's Gemini model (3.1): try it first.
-      for (int i = 0; i < models.size(); i++) {
-        if (models.get(i).contains("3.1-flash")) {
-          models.add(0, models.remove(i));
-          break;
-        }
-      }
-      // A model typed in the app's settings always goes first.
-      String forced = getSharedPreferences("agent", MODE_PRIVATE).getString("model", "").trim();
-      if (!forced.isEmpty()) {
-        models.remove(forced);
-        models.add(0, forced);
-      }
-    } else {
-      models.add(prov.equals("deepseek") ? Gemini.DEEPSEEK_MODEL : Gemini.OPENAI_MODEL);
+    if (!key.trim().startsWith("AIza")) {
+      finishFail("this app needs a Gemini API key (it starts with AIza)");
+      return;
+    }
+    List<String> models = new ArrayList<>(Gemini.pickModels(key));
+    // A model typed in the app's settings always goes first.
+    String forced = getSharedPreferences("agent", MODE_PRIVATE).getString("model", "").trim();
+    if (!forced.isEmpty()) {
+      models.remove(forced);
+      models.add(0, forced);
     }
     wantShotNext = false;
 
@@ -299,10 +308,7 @@ public class AgentService extends AccessibilityService {
         pace(mi == 0 ? 9 : 13);
         if (stopFlag) return;
         try {
-          reply =
-              prov.equals("gemini")
-                  ? Gemini.generate(key, models.get(mi), SYS, p.toString(), shot)
-                  : Gemini.generateOai(prov, key, SYS, p.toString(), shot);
+          reply = Gemini.generate(key, models.get(mi), SYS, p.toString(), shot);
         } catch (Gemini.GeminiException e) {
           if (stopFlag) return;
           if ((e.code == 429 || e.code >= 500 || e.modelProblem) && mi + 1 < models.size()) {
@@ -432,13 +438,13 @@ public class AgentService extends AccessibilityService {
     }
     String msg = s.toString();
     publish(msg);
-    speak(msg);
+    speakQueued(msg, "en");
   }
 
   private void finishFail(String reason) {
     String msg = "The task could not be completed: " + reason;
     publish(msg);
-    speak(msg);
+    speakQueued(msg, "en");
   }
 
   private String friendly(Gemini.GeminiException e) {
@@ -480,6 +486,38 @@ public class AgentService extends AccessibilityService {
   private void speak(String text) {
     if (tts != null && ttsReady) {
       tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "agent");
+    }
+  }
+
+  private String lastLang = "en";
+
+  /** Adds speech to the end of the queue (never cuts off what is already being said). */
+  private void speakQueued(String text, String lang) {
+    if (tts == null || !ttsReady || text == null || text.trim().isEmpty()) return;
+    String l = "hi".equals(lang) ? "hi" : "en";
+    if (!l.equals(lastLang)) {
+      long end = System.currentTimeMillis() + 120000;
+      while (!stopFlag && tts != null && tts.isSpeaking() && System.currentTimeMillis() < end) {
+        try {
+          Thread.sleep(200);
+        } catch (InterruptedException e) {
+          return;
+        }
+      }
+      if (tts == null) return;
+      tts.setLanguage(l.equals("hi") ? new Locale("hi", "IN") : Locale.ENGLISH);
+      lastLang = l;
+    }
+    String t = text.trim();
+    int n = 0;
+    while (!t.isEmpty() && tts != null) {
+      int cut = Math.min(t.length(), 3000);
+      if (cut < t.length()) {
+        int dot = Math.max(t.lastIndexOf(". ", cut), t.lastIndexOf("\u0964", cut));
+        if (dot > 500) cut = dot + 1;
+      }
+      tts.speak(t.substring(0, cut), TextToSpeech.QUEUE_ADD, null, "agent" + (n++));
+      t = t.substring(cut).trim();
     }
   }
 
@@ -747,6 +785,15 @@ public class AgentService extends AccessibilityService {
       case "screenshot":
         wantShotNext = true;
         return "a screenshot will be attached to the next step";
+      case "open_url":
+        return openUrl(a.optString("url", ""), a.optString("package", ""));
+      case "speak":
+        {
+          String t = a.optString("text", "").trim();
+          if (t.isEmpty()) return "ERROR: text needed";
+          speakQueued(t, a.optString("lang", "en"));
+          return "spoken";
+        }
       default:
         return "ERROR: unknown action '" + act + "'";
     }
@@ -875,6 +922,30 @@ public class AgentService extends AccessibilityService {
       return "opened " + best.loadLabel(pm);
     } catch (Exception e) {
       return "open failed";
+    }
+  }
+
+  private String openUrl(String url, String pkg) {
+    String u = url == null ? "" : url.trim();
+    if (!(u.startsWith("https://") || u.startsWith("http://"))) {
+      return "ERROR: only http and https links are allowed";
+    }
+    Intent i =
+        new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+    String p = pkg == null ? "" : pkg.trim();
+    if (!p.isEmpty()) {
+      try {
+        startActivity(new Intent(i).setPackage(p));
+        return "opened the link in " + p;
+      } catch (Exception ignored) {
+        // that app is not installed: use the default one
+      }
+    }
+    try {
+      startActivity(i);
+      return "opened the link";
+    } catch (Exception e) {
+      return "open link failed";
     }
   }
 
