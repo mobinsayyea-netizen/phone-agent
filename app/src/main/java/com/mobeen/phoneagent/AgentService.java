@@ -223,6 +223,7 @@ public class AgentService extends AccessibilityService {
     int same = 0;
     int bad = 0;
     int mi = 0;
+    List<String> models = Gemini.pickModels(key);
     wantShotNext = false;
 
     publish("Working on it");
@@ -279,10 +280,10 @@ public class AgentService extends AccessibilityService {
         pace(mi == 0 ? 9 : 13);
         if (stopFlag) return;
         try {
-          reply = Gemini.generate(key, Gemini.MODELS[mi], SYS, p.toString(), shot);
+          reply = Gemini.generate(key, models.get(mi), SYS, p.toString(), shot);
         } catch (Gemini.GeminiException e) {
           if (stopFlag) return;
-          if (e.code == 429 && mi + 1 < Gemini.MODELS.length) {
+          if ((e.code == 429 || e.modelProblem) && mi + 1 < models.size()) {
             mi++;
             continue;
           }
@@ -426,6 +427,9 @@ public class AgentService extends AccessibilityService {
             + " project also use this limit.";
       }
       return "the per-minute Gemini limit was reached. Wait one minute and try again.";
+    }
+    if (e.modelProblem) {
+      return "none of the available Gemini models worked for this key (" + clipMsg(e.getMessage()) + ")";
     }
     if (e.code == 400 || e.code == 401 || e.code == 403) {
       return "the Gemini API key is not valid or is not allowed (" + clipMsg(e.getMessage()) + ")";

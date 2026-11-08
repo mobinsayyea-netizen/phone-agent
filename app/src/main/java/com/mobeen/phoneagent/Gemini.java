@@ -9,28 +9,128 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Minimal Gemini REST client (no external libraries). */
+/** Minimal Gemini REST client (no external libraries) with automatic model discovery. */
 final class Gemini {
-  /** Tried in order. Each model has its own free quota, so we fall back when one runs out. */
-  static final String[] MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"};
+  private static final String BASE = "https://generativelanguage.googleapis.com/v1beta/";
+
+  /** Used only if the live model list cannot be fetched. */
+  private static final String[] FALLBACK = {
+    "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash-lite"
+  };
+
+  private static List<String> cached;
+  private static String cachedFor = "";
+  private static long cachedAt;
+  private static final Set<String> noThinking = new HashSet<>();
 
   static class GeminiException extends Exception {
     final int code;
     final boolean daily;
+    final boolean modelProblem;
 
     GeminiException(int code, String msg, boolean daily) {
       super(msg);
       this.code = code;
       this.daily = daily;
+      String m = msg == null ? "" : msg.toLowerCase();
+      this.modelProblem =
+          code == 404
+              || m.contains("no longer available")
+              || m.contains("is not found")
+              || m.contains("not supported for generatecontent");
     }
   }
 
   private Gemini() {}
 
-  static String generate(String key, String model, String system, String prompt, String jpegB64)
+  // ---------- model discovery ----------
+
+  /** Asks the API which models this key can use and returns the best ones, best first. */
+  static synchronized List<String> pickModels(String key) {
+    long now = System.currentTimeMillis();
+    if (cached != null && key.equals(cachedFor) && now - cachedAt < 6L * 3600 * 1000) {
+      return cached;
+    }
+    List<String> result = new ArrayList<>();
+    try {
+      List<String[]> found = new ArrayList<>(); // {id, score}
+      String token = "";
+      for (int page = 0; page < 4; page++) {
+        String url = BASE + "models?pageSize=200" + (token.isEmpty() ? "" : "&pageToken=" + token);
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(30000);
+        c.setRequestProperty("x-goog-api-key", key);
+        int code = c.getResponseCode();
+        String resp = read(code >= 200 && code < 300 ? c.getInputStream() : c.getErrorStream());
+        c.disconnect();
+        if (code < 200 || code >= 300) break;
+        JSONObject r = new JSONObject(resp);
+        JSONArray arr = r.optJSONArray("models");
+        if (arr != null) {
+          for (int i = 0; i < arr.length(); i++) {
+            JSONObject m = arr.getJSONObject(i);
+            JSONArray meth = m.optJSONArray("supportedGenerationMethods");
+            boolean ok = false;
+            if (meth != null) {
+              for (int k = 0; k < meth.length(); k++) {
+                if ("generateContent".equals(meth.optString(k))) ok = true;
+              }
+            }
+            if (!ok) continue;
+            String id = m.optString("name", "").replace("models/", "");
+            String score = score(id);
+            if (score != null) found.add(new String[] {id, score});
+          }
+        }
+        token = r.optString("nextPageToken", "");
+        if (token.isEmpty()) break;
+      }
+      Collections.sort(found, (x, y) -> y[1].compareTo(x[1]));
+      for (String[] f : found) {
+        if (!result.contains(f[0])) result.add(f[0]);
+        if (result.size() >= 4) break;
+      }
+    } catch (Exception ignored) {
+    }
+    if (result.isEmpty()) {
+      for (String f : FALLBACK) result.add(f);
+    } else {
+      cached = result;
+      cachedFor = key;
+      cachedAt = now;
+    }
+    return result;
+  }
+
+  /** Higher string = better. Null = not a plain text flash model we want. */
+  private static String score(String id) {
+    Matcher m = Pattern.compile("^gemini-(\\d+)(?:\\.(\\d+))?-(flash-lite|flash)(.*)$").matcher(id);
+    if (!m.matches()) return null;
+    String rest = m.group(4).toLowerCase();
+    String[] bad = {
+      "image", "tts", "live", "audio", "embed", "robotics", "exp", "thinking", "native",
+      "computer", "customtools", "vision"
+    };
+    for (String b : bad) if (rest.contains(b)) return null;
+    int major = Integer.parseInt(m.group(1));
+    int minor = m.group(2) == null ? 0 : Integer.parseInt(m.group(2));
+    boolean lite = m.group(3).equals("flash-lite");
+    boolean preview = rest.contains("preview");
+    return String.format("%03d.%03d.%d.%d", major, minor, lite ? 0 : 1, preview ? 0 : 1);
+  }
+
+  // ---------- generation ----------
+
+  private static byte[] payload(String model, String system, String prompt, String jpegB64)
       throws Exception {
     JSONObject body = new JSONObject();
     body.put(
@@ -48,24 +148,28 @@ final class Gemini {
     body.put(
         "contents",
         new JSONArray().put(new JSONObject().put("role", "user").put("parts", parts)));
-    body.put(
-        "generationConfig",
-        new JSONObject()
-            .put("responseMimeType", "application/json")
-            .put("temperature", 0.2)
-            .put("thinkingConfig", new JSONObject().put("thinkingBudget", 0)));
-    byte[] payload = body.toString().getBytes("UTF-8");
+    JSONObject gen = new JSONObject().put("responseMimeType", "application/json");
+    boolean v3 = model.startsWith("gemini-3");
+    if (!v3) gen.put("temperature", 0.2);
+    if (!noThinking.contains(model)) {
+      gen.put(
+          "thinkingConfig",
+          v3
+              ? new JSONObject().put("thinkingLevel", "minimal")
+              : new JSONObject().put("thinkingBudget", 0));
+    }
+    body.put("generationConfig", gen);
+    return body.toString().getBytes("UTF-8");
+  }
 
+  static String generate(String key, String model, String system, String prompt, String jpegB64)
+      throws Exception {
     int tries429 = 0;
     int tries5xx = 0;
     while (true) {
+      byte[] data = payload(model, system, prompt, jpegB64);
       HttpURLConnection c =
-          (HttpURLConnection)
-              new URL(
-                      "https://generativelanguage.googleapis.com/v1beta/models/"
-                          + model
-                          + ":generateContent")
-                  .openConnection();
+          (HttpURLConnection) new URL(BASE + "models/" + model + ":generateContent").openConnection();
       c.setRequestMethod("POST");
       c.setConnectTimeout(20000);
       c.setReadTimeout(90000);
@@ -73,7 +177,7 @@ final class Gemini {
       c.setRequestProperty("x-goog-api-key", key);
       c.setDoOutput(true);
       try (OutputStream os = c.getOutputStream()) {
-        os.write(payload);
+        os.write(data);
       }
       int code = c.getResponseCode();
       InputStream is = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
@@ -83,6 +187,10 @@ final class Gemini {
         return extractText(resp);
       }
       String msg = errorMessage(resp);
+      if (code == 400 && msg.toLowerCase().contains("thinking") && !noThinking.contains(model)) {
+        noThinking.add(model); // this model rejects our thinking setting: retry without it
+        continue;
+      }
       if (code == 429) {
         boolean daily = resp.contains("PerDay");
         if (daily) throw new GeminiException(429, msg, true);
@@ -125,7 +233,9 @@ final class Gemini {
     StringBuilder sb = new StringBuilder();
     if (ps != null) {
       for (int i = 0; i < ps.length(); i++) {
-        sb.append(ps.getJSONObject(i).optString("text", ""));
+        JSONObject p = ps.getJSONObject(i);
+        if (p.optBoolean("thought", false)) continue;
+        sb.append(p.optString("text", ""));
       }
     }
     return sb.toString();
