@@ -39,6 +39,7 @@ public class MainActivity extends Activity {
 
   private SharedPreferences prefs;
   private EditText keyBox;
+  private EditText modelBox;
   private LinearLayout keyRow;
   private Button cancelBtn;
   private Button changeBtn;
@@ -90,6 +91,13 @@ public class MainActivity extends Activity {
     keyBox.setSingleLine(true);
     keyBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
     root.addView(keyBox, lp());
+
+    modelBox = new EditText(this);
+    modelBox.setHint("Model name (optional, empty = automatic)");
+    modelBox.setTextSize(18);
+    modelBox.setSingleLine(true);
+    modelBox.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+    root.addView(modelBox, lp());
 
     keyRow = new LinearLayout(this);
     keyRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -163,6 +171,8 @@ public class MainActivity extends Activity {
     keyBox.setText("");
     keyBox.setHint(savedKey().isEmpty() ? "API key (Gemini or DeepSeek)" : "Enter new API key");
     keyBox.setVisibility(View.VISIBLE);
+    modelBox.setText(prefs.getString("model", ""));
+    modelBox.setVisibility(View.VISIBLE);
     keyRow.setVisibility(View.VISIBLE);
     cancelBtn.setVisibility(savedKey().isEmpty() ? View.GONE : View.VISIBLE);
     changeBtn.setVisibility(View.GONE);
@@ -171,6 +181,7 @@ public class MainActivity extends Activity {
   private void hideKeyEditor() {
     keyBox.setText("");
     keyBox.setVisibility(View.GONE);
+    modelBox.setVisibility(View.GONE);
     keyRow.setVisibility(View.GONE);
     changeBtn.setVisibility(View.VISIBLE);
   }
@@ -189,13 +200,17 @@ public class MainActivity extends Activity {
 
   private void saveKey() {
     String k = keyBox.getText().toString().trim();
-    if (k.isEmpty()) {
+    String m = modelBox.getText().toString().trim();
+    if (k.isEmpty() && savedKey().isEmpty()) {
       announce("The API key box is empty");
       return;
     }
-    prefs.edit().putString(KEY, k).apply();
+    SharedPreferences.Editor ed = prefs.edit();
+    if (!k.isEmpty()) ed.putString(KEY, k);
+    ed.putString("model", m);
+    ed.apply();
     hideKeyEditor();
-    announce("API key saved successfully");
+    announce(k.isEmpty() ? "Settings saved successfully" : "API key saved successfully");
   }
 
   private void cancelKey() {
